@@ -1,0 +1,50 @@
+// andappsvc_client.exe resources
+//
+// The driver binary is embedded as an RCDATA payload and installed/started by
+// the client at launch (see src/driver_install.cpp).  The copy in res/ is
+// byte-identical to the analysed andappsvc2_64.sys:
+//   size   0x7A98 (31384)
+//   sha256 09a5ca7673f3734f8987b2b4d69255ffaa05cd2e77cf2d6f72a2d6a3c91139fb
+//   signed by "Microsoft Windows Hardware Compatibility Publisher"
+//
+// Build:  rc.exe /I res res\andappsvc.rc      (MSVC)
+//         windres -I res -i res/andappsvc.rc  (mingw)
+#include <windows.h>
+
+#define IDR_DRIVER_PAYLOAD 101
+
+// The embedded kernel driver.  Keep in sync with kDriverResourceId in
+// src/driver_install.h.
+IDR_DRIVER_PAYLOAD RCDATA "andappsvc2_64.sys"
+
+// requireAdministrator manifest: installing the driver needs an elevated token.
+1 RT_MANIFEST "andappsvc.exe.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "andappsvc"
+            VALUE "FileDescription", "andappsvc2 process protection client"
+            VALUE "FileVersion", "1.0.0.0"
+            VALUE "InternalName", "andappsvc_client"
+            VALUE "LegalCopyright", "for authorised security testing only"
+            VALUE "OriginalFilename", "andappsvc_client.exe"
+            VALUE "ProductName", "andappsvc client"
+            VALUE "ProductVersion", "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

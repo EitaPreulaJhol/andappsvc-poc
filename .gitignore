@@ -1,0 +1,19 @@
+# Build outputs and debugger databases
+build/
+*.obj
+*.o
+*.res
+*.res.o
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+
+# Runtime artefacts
+andappsvc_policy.ini
