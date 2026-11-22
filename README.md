@@ -332,15 +332,145 @@ protection disappears.
   directory as the protected image (`IsImageInProtectedDirectory`, which also
   requires `ExpectedParentPid` for `svchost.exe`).
 * Otherwise `DesiredAccess &= 0xFFFFFFC5` removes create-thread and all VM
-  read/write/operation rights, the caller is recorded in `DeniedAccessPids[3]`,
-  and the post-operation callback promotes it to `LastDeniedPid`, which
-  `0xAA023818` hands back as `<pid> | 0x40000000`.
+  read/write/operation rights, and the caller is recorded in
+  `DeniedAccessPids[3]`. The post-operation callback clears that record and, if
+  the handle still carries any of the stripped bits, exposes the PID through
+  `LastDeniedPid` (`<pid> | 0x40000000` from `0xAA023818`).
 * Callers that were allowed are recorded in `GrantedAccessPids[12]` (bit 31 =
   "protection was disabled at the time", bit 29 in slot 0 = "log full").
   `andappsvc_client.exe self` prints them as they appear.
 * Because `Monitored` and `ProtectionEnabled` belong to the session owner, the
   policy can only be installed by the process that is being protected. The
   payload DLL exists to run that sequence inside a foreign process.
+
+### Protection capabilities
+
+The filter gives the session owner four practical capabilities: block
+handle-based memory access and thread injection into the protected process, keep
+selected tools working through the allow-lists, observe which PIDs request
+guarded access, and switch between enforce and monitor-only at runtime. It is an
+access-rights filter for process handles, not a sandbox: it does not protect
+memory, threads, files or registry keys directly, and it does not deny access
+outright.
+
+#### When a request is filtered
+
+`ObPreOperationCallback` evaluates a request only when every one of these holds:
+
+| Condition | Implementation check |
+|---|---|
+| The object is a process | the callback is registered for `PsProcessType` |
+| The operation is create or duplicate | `Operation == 1` or `Operation == 2` |
+| The caller is a user-mode client | `KernelHandle == 0` |
+| The target owns a session | `FindSessionIndexByPid(target_pid) != -1` |
+| The target session is monitored | `Monitored != 0` |
+| The caller is not the target | `target_pid != caller_pid` |
+| The handle asks for a guarded right | `DesiredAccess & 0x3A != 0` |
+
+Everything else passes through unchanged and is not logged. In particular,
+opening the process for `PROCESS_QUERY_LIMITED_INFORMATION` or
+`PROCESS_TERMINATE` alone never reaches the policy; only requests that include
+one of the four thread/VM rights below are subject to the decision.
+
+#### Allow/deny decision
+
+For a filtered request, the callback applies the target session's policy in this
+order. The first matching rule wins:
+
+1. **Trusted PIDs.** If the caller's PID equals one of the 5 `TrustedPids`
+   entries, the requested access is allowed.
+2. **Parent whitelist.** If the caller's inherited-from PID
+   (`PsGetProcessInheritedFromUniqueProcessId`) equals one of the 3
+   `InheritedPidBlacklist` entries, access is allowed. Despite the field name,
+   this is a whitelist for children of those PIDs.
+3. **System-image exceptions.** The caller's short image name is compared
+   byte-wise against four decoded strings:
+   * `svchost.exe` is allowed only when its parent PID equals the session's
+     `ExpectedParentPid` and `IsImageInProtectedDirectory` matches;
+   * `csrss.exe`, `lsass.exe` and `conhost.exe` are allowed when
+     `IsImageInProtectedDirectory` matches.
+   `IsImageInProtectedDirectory` builds `<protected image>\<short name>`,
+   upper-cases both that string and the caller's `ProcessImageFileName`, and
+   compares them. It matches only a sibling of the protected image with the same
+   short name; the comparison is case-insensitive but not normalised, and a
+   failed `ZwQueryInformationProcess` returns false (no exception).
+4. **Deny.** Otherwise the requested access is masked:
+
+| Right | Value | After the filter |
+|---|---:|---|
+| `PROCESS_CREATE_THREAD` | `0x0002` | cleared |
+| `PROCESS_VM_OPERATION` | `0x0008` | cleared |
+| `PROCESS_VM_READ` | `0x0010` | cleared |
+| `PROCESS_VM_WRITE` | `0x0020` | cleared |
+| all other rights (`PROCESS_TERMINATE`, `PROCESS_DUP_HANDLE`, `PROCESS_QUERY_INFORMATION`, `PROCESS_SET_INFORMATION`, `PROCESS_SUSPEND_RESUME`, ...) | | kept |
+
+The implementation is `DesiredAccess &= 0xFFFFFFC5` (`~0x3A`). A denied caller
+is recorded in `DeniedAccessPids[3]` (first free slot; if all 3 are full the
+record is dropped), while the handle is still returned with the remaining
+rights.
+
+#### Policy controls
+
+All policy IOCTLs are level 1 and, apart from the global image path and the
+one-time callback registration, affect only the caller's own session entry. That
+entry is the one consulted when a handle targets the caller's process:
+
+| IOCTL | Effect on the caller's `PROC_TRACK_ENTRY` |
+|---|---|
+| `0xAA023800` | stores the NT image path in the global `g_ProtectedImageName`, sets `ProtectionEnabled = 1` and `Monitored = 1`, and installs the Ob registration if none exists yet |
+| `0xAA023804` | clears `ProtectionEnabled`: no masking, but allowed accesses are still logged with bit 31 |
+| `0xAA023808` | sets `ProtectionEnabled = 1`: resumes masking |
+| `0xAA02380C` | replaces `TrustedPids[5]` (20 input bytes) |
+| `0xAA023810` | replaces `InheritedPidBlacklist[3]` (12 input bytes) |
+| `0xAA023814` | sets `ExpectedParentPid` (4 input bytes) |
+| `0xAA023818` | drains the access log (48 output bytes, described below) |
+
+The Ob registration covers `CREATE | DUPLICATE`, uses a `88180.`-prefixed
+altitude and both callbacks, and at most one registration exists at a time. It
+is removed when the session table becomes empty.
+
+#### Access log
+
+The per-session log is the driver's observation capability:
+
+* `GrantedAccessPids[12]` records up to 12 distinct caller PIDs whose filtered
+  handle access was allowed. An entry gets bit 31 set when the record was made
+  while `ProtectionEnabled == 0`; when all slots are full, slot 0 gets bit 29
+  and further grants are not recorded. A duplicate grant for an already recorded
+  PID does not add another slot.
+* `DeniedAccessPids[3]` holds up to 3 PIDs whose access was stripped between the
+  pre- and post-callbacks. The post-callback clears each matching slot; if the
+  finally granted handle still contains any of the four guarded bits, it also
+  sets `LastDeniedPid` to that PID. Because the pre-callback normally removes
+  those bits before the post-callback runs, this marker is not the primary
+  record of a denial.
+* `0xAA023818` copies the 12 grant slots to user mode, clears them, then, if
+  `LastDeniedPid` is non-zero, writes it as `<pid> | 0x40000000` into the first
+  zero slot and clears it.
+
+#### Scope and lifetime
+
+* `Monitored`, `ProtectionEnabled`, the allow-lists and the log are fields of the
+  target's session, and the callback consults the target's entry. Protection is
+  therefore self-installed; the payload DLL exists to run that sequence inside a
+  foreign process.
+* Several sessions can be monitored at once, each with its own allow-lists and
+  log. `g_ProtectedImageName`, however, is global: a later `0xAA023800` from
+  another authenticated session replaces the path used by all sessions' image
+  exceptions.
+* At most 100 sessions exist (one per PID). `IRP_MJ_CLEANUP` zeroes the session
+  and unregisters the Ob callbacks once the table is empty; `DriverUnload` does
+  the same. Keeping the process and its device handle alive is required for the
+  filter to stay installed, and there is no IOCTL that clears `Monitored` for a
+  live session.
+* The filter applies to new and duplicated handles only. Handles that were
+  already open with full access keep it, and the mask is not a full deny: the
+  target can still be queried, have its information changed, suspended/resumed,
+  terminated, or have handles duplicated. When `ProtectionEnabled == 0`, the
+  driver masks nothing but still records allowed access attempts, which makes
+  the disabled state a passive monitor mode.
+* Both callbacks run under `g_ProcessTableLock`, serialising the decision and
+  the log updates.
 
 ## Usage
 
